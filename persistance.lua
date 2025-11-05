@@ -14,8 +14,8 @@ local Persistence = {
   autosaveSeconds = 60,
 
   -- Apply saved positions for categories (teleport by respawn)
-  -- Aircraft respawns can be heavy; default off to avoid stutters
-  repositionCategories = { vehicle = true, ship = true, plane = false, helicopter = false },
+  -- Aircraft/helos now supported (AI only)
+  repositionCategories = { vehicle = true, ship = true, plane = true, helicopter = true },
 
   -- Delay between respawning groups when applying positions (seconds)
   spawnThrottleSeconds = 0.2,
@@ -367,7 +367,11 @@ function Persistence:buildTemplateIndex()
           if gc and gc.group then
             for _, g in pairs(gc.group) do
               if g and g.name and g.units then
-                self._groupTemplates[g.name] = { tpl = g, countryId = cid, categoryKey = catKey }
+                local hasClient = false
+                for _, u in ipairs(g.units) do
+                  if u.skill == "Client" or u.skill == "Player" then hasClient = true break end
+                end
+                self._groupTemplates[g.name] = { tpl = g, countryId = cid, categoryKey = catKey, hasClient = hasClient }
                 for _, u in ipairs(g.units) do
                   if u.name then self._unitToGroup[u.name] = g.name end
                 end
@@ -389,13 +393,15 @@ function Persistence:captureUnitPositions()
     if u and u.isExist and u:isExist() then
       local name = u.getName and u:getName()
       if name and name ~= "" and not self.state.deadUnits[name] then
+        -- Skip player-occupied units (AI only)
+        if u.getPlayerName and u:getPlayerName() then return true end
         local pos = u:getPosition()
         local p = pos.p or u:getPoint()
         local heading = 0
         if pos and pos.x then
           heading = math.atan2(pos.x.z or 0, pos.x.x or 1)
         end
-        saved[name] = { x = p.x, z = p.z, heading = heading }
+        saved[name] = { x = p.x, y = p.y, z = p.z, heading = heading }
       end
     end
     return true
@@ -423,7 +429,8 @@ function Persistence:applySavedPositions()
     local meta = self._groupTemplates[gname]
     if meta and meta.tpl and meta.countryId then
       local catKey = meta.categoryKey
-      if self.repositionCategories[catKey] then
+      -- Skip groups with client/player slots when moving air categories
+      if self.repositionCategories[catKey] and not (meta.hasClient and (catKey == 'plane' or catKey == 'helicopter')) then
         table.insert(ops, { gname = gname, unitPos = unitPos, meta = meta })
       end
     end
@@ -455,6 +462,14 @@ function Persistence:applySavedPositions()
           u.x = unitPos[uName].x
           u.y = unitPos[uName].z
           u.heading = unitPos[uName].heading or u.heading or 0
+          if catKey == 'plane' or catKey == 'helicopter' then
+            -- Set altitude when available for air units
+            local alt = unitPos[uName].y
+            if alt then
+              u.alt = alt
+              u.alt_type = u.alt_type or "BARO"
+            end
+          end
         end
         table.insert(keepUnits, u)
       end
