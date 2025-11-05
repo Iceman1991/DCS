@@ -65,6 +65,59 @@ local function sanitizeKey(s)
   return s
 end
 
+-- UTIL: Simple stable hash (djb2, 32-bit) for fingerprinting
+local function djb2(s)
+  local hash = 5381
+  for i = 1, #s do
+    hash = ((hash * 33) % 4294967296 + s:byte(i)) % 4294967296
+  end
+  return hash
+end
+
+local function tohex32(n)
+  return string.format("%08x", n % 4294967296)
+end
+
+-- UTIL: Collect sorted group names from a coalition side table
+local function collectGroupNames(sideTbl)
+  local names = {}
+  if not sideTbl or not sideTbl.country then return names end
+  for _, country in pairs(sideTbl.country) do
+    local branches = {"plane", "helicopter", "vehicle", "ship", "static"}
+    for _, branch in ipairs(branches) do
+      local b = country[branch]
+      if b and b.group then
+        for _, g in pairs(b.group) do
+          if g and g.name then table.insert(names, tostring(g.name)) end
+        end
+      end
+    end
+  end
+  table.sort(names)
+  return names
+end
+
+-- Build a stable fingerprint of the current mission setup
+function Persistence:computeFingerprint()
+  local theatre = (env and env.mission and env.mission.theatre) or "unknown"
+  local generalName = (env and env.mission and env.mission.general and env.mission.general.name) or ""
+  local names = {}
+  if env and env.mission and env.mission.coalition then
+    local sides = {
+      env.mission.coalition.blue,
+      env.mission.coalition.red,
+      env.mission.coalition.neutral,
+    }
+    for _, side in ipairs(sides) do
+      local arr = collectGroupNames(side)
+      for _, n in ipairs(arr) do table.insert(names, n) end
+    end
+  end
+  local base = theatre .. "|" .. generalName .. "|" .. table.concat(names, ",")
+  local h = djb2(base)
+  return "fpv1:" .. tohex32(h)
+end
+
 -- UTIL: Serialize a simple table as Lua literal (no cycles)
 local function serialize(val, indent)
   indent = indent or ""
@@ -185,6 +238,15 @@ function Persistence:save(force)
     log("Failed to open state for write: " .. tostring(err))
     return false
   end
+  -- Attach meta to ensure correct mission on load
+  local theatre = (env and env.mission and env.mission.theatre) or "unknown"
+  local generalName = (env and env.mission and env.mission.general and env.mission.general.name) or nil
+  self.state.meta = {
+    key = self:getKey(),
+    fp = self:computeFingerprint(),
+    theatre = theatre,
+    missionName = generalName,
+  }
   local payload = "return " .. serialize(self.state)
   f:write(payload)
   f:close()
@@ -198,7 +260,7 @@ function Persistence:load()
   if not path then return false end
   local f = io.open(path, "r")
   if not f then
-    log("No saved state found for key '" .. self:getKey() .. "'")
+    log("No saved state found for key '" .. self:getKey() .. "' (" .. tostring(path) .. ")")
     return false
   end
   local data = f:read("*a")
@@ -212,6 +274,21 @@ function Persistence:load()
   if not ok or type(tbl) ~= "table" then
     log("State file did not return a table")
     return false
+  end
+  -- Validate meta to ensure file belongs to this mission
+  local expectKey = self:getKey()
+  local expectFp = self:computeFingerprint()
+  if tbl.meta then
+    if tbl.meta.key ~= expectKey then
+      log("State meta key mismatch (expected '" .. expectKey .. "', got '" .. tostring(tbl.meta.key) .. "'). Aborting load.")
+      return false
+    end
+    if tbl.meta.fp ~= expectFp then
+      log("State fingerprint mismatch (expected '" .. expectFp .. "', got '" .. tostring(tbl.meta.fp) .. "'). Aborting load.")
+      return false
+    end
+  else
+    log("State has no meta; proceeding with legacy load based on key only.")
   end
   self.state = tbl
   self.state.deadUnits = self.state.deadUnits or {}
@@ -482,24 +559,9 @@ do
     end
     Persistence:save(true)
   end)
-  missionCommands.addCommand("Reset state (wipe)", root, function()
-    if not Persistence:ioAvailable() then
-      trigger.action.outText("Persistence disabled: enable lfs/io in MissionScripting.lua", 10)
-      return
-    end
-    Persistence:reset()
-  end)
-  missionCommands.addCommand("Show key", root, function() trigger.action.outText("Persistence key: " .. Persistence:getKey(), 10) end)
-  missionCommands.addCommand("Apply now (debug)", root, function()
-    local removed, au, fu, as, fs = Persistence:applyStateOnce()
-    trigger.action.outText(string.format("Persistence apply: removed=%d, units found=%d/%d, statics found=%d/%d", removed, fu, au, fs, as), 10)
-  end)
-  missionCommands.addCommand("Capture positions now", root, function()
-    Persistence:captureUnitPositions()
-    trigger.action.outText("Persistence: positions snapshot updated.", 8)
-  end)
-  missionCommands.addCommand("Apply saved positions", root, function()
-    Persistence:applySavedPositions()
+  missionCommands.addCommand("Show file name", root, function()
+    local p = Persistence:getStatePath() or "state.lua"
+    trigger.action.outText("Persistence file: " .. p, 10)
   end)
 end
 
