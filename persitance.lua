@@ -13,6 +13,13 @@ local Persistence = {
   -- Auto-save every N seconds (nil/false to disable periodic saving)
   autosaveSeconds = 60,
 
+  -- Apply saved positions for categories (teleport by respawn)
+  -- Aircraft respawns can be heavy; default off to avoid stutters
+  repositionCategories = { vehicle = true, ship = true, plane = false, helicopter = false },
+
+  -- Delay between respawning groups when applying positions (seconds)
+  spawnThrottleSeconds = 0.2,
+
   -- Track client/player losses too? (false keeps client slots fresh)
   trackClientLosses = false,
 
@@ -20,11 +27,15 @@ local Persistence = {
   state = {
     deadUnits = {},
     deadStatics = {},
+    unitPos = {},
   },
 
   _saveDebounce = false,
   _bootstrapped = false,
   _autosaveStarted = false,
+  _templateIndexBuilt = false,
+  _groupTemplates = {}, -- [groupName] = { tpl=table, countryId=number, categoryKey=string }
+  _unitToGroup = {},    -- [unitName] = groupName
 }
 
 -- UTIL: Safe logging
@@ -79,6 +90,16 @@ local function serialize(val, indent)
   else
     return "nil"
   end
+end
+
+-- UTIL: Deep copy a table (no cycles expected)
+local function deepcopy(t)
+  if type(t) ~= "table" then return t end
+  local r = {}
+  for k,v in pairs(t) do
+    r[deepcopy(k)] = deepcopy(v)
+  end
+  return r
 end
 
 -- Build base directory under Saved Games
@@ -154,6 +175,9 @@ function Persistence:save(force)
     return
   end
 
+  -- Update alive unit positions snapshot before writing
+  self:captureUnitPositions()
+
   local path = self:getStatePath()
   if not path then return false end
   local f, err = io.open(path, "w")
@@ -190,6 +214,9 @@ function Persistence:load()
     return false
   end
   self.state = tbl
+  self.state.deadUnits = self.state.deadUnits or {}
+  self.state.deadStatics = self.state.deadStatics or {}
+  self.state.unitPos = self.state.unitPos or {}
   log("Loaded state from " .. path)
   return true
 end
@@ -243,6 +270,139 @@ function Persistence:applyStateWithRetries(retries, interval)
   timer.scheduleFunction(tick, {}, timer.getTime() + 2)
 end
 
+-- Build index of mission templates to allow group respawn with updated positions
+function Persistence:buildTemplateIndex()
+  if self._templateIndexBuilt then return end
+  if not env or not env.mission or not env.mission.coalition then return end
+  local catMap = {
+    plane = Group.Category.AIRPLANE,
+    helicopter = Group.Category.HELICOPTER,
+    vehicle = Group.Category.GROUND,
+    ship = Group.Category.SHIP,
+  }
+  local coal = env.mission.coalition
+  for _, sideKey in ipairs({"blue","red","neutral"}) do
+    local side = coal[sideKey]
+    if side and side.country then
+      for _, country in pairs(side.country) do
+        local cid = country.id
+        for catKey, gc in pairs({plane=country.plane, helicopter=country.helicopter, vehicle=country.vehicle, ship=country.ship}) do
+          if gc and gc.group then
+            for _, g in pairs(gc.group) do
+              if g and g.name and g.units then
+                self._groupTemplates[g.name] = { tpl = g, countryId = cid, categoryKey = catKey }
+                for _, u in ipairs(g.units) do
+                  if u.name then self._unitToGroup[u.name] = g.name end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  self._templateIndexBuilt = true
+end
+
+-- Capture alive units' last positions and headings
+function Persistence:captureUnitPositions()
+  local vol = { id = world.VolumeType.SPHERE, params = { point = {x = 0, y = 0, z = 0}, radius = 2e6 } }
+  local saved = self.state.unitPos or {}
+  world.searchObjects(Object.Category.UNIT, vol, function(u)
+    if u and u.isExist and u:isExist() then
+      local name = u.getName and u:getName()
+      if name and name ~= "" and not self.state.deadUnits[name] then
+        local pos = u:getPosition()
+        local p = pos.p or u:getPoint()
+        local heading = 0
+        if pos and pos.x then
+          heading = math.atan2(pos.x.z or 0, pos.x.x or 1)
+        end
+        saved[name] = { x = p.x, z = p.z, heading = heading }
+      end
+    end
+    return true
+  end)
+  self.state.unitPos = saved
+end
+
+-- Apply saved positions by respawning groups based on mission templates
+function Persistence:applySavedPositions()
+  self:buildTemplateIndex()
+  local byGroup = {}
+  for uname, pos in pairs(self.state.unitPos or {}) do
+    if not self.state.deadUnits[uname] then
+      local gname = self._unitToGroup[uname]
+      if gname then
+        byGroup[gname] = byGroup[gname] or {}
+        byGroup[gname][uname] = pos
+      end
+    end
+  end
+
+  -- Build queued operations and process them with a small delay between each
+  local ops = {}
+  for gname, unitPos in pairs(byGroup) do
+    local meta = self._groupTemplates[gname]
+    if meta and meta.tpl and meta.countryId then
+      local catKey = meta.categoryKey
+      if self.repositionCategories[catKey] then
+        table.insert(ops, { gname = gname, unitPos = unitPos, meta = meta })
+      end
+    end
+  end
+
+  local idx = 0
+  local function step()
+    idx = idx + 1
+    local op = ops[idx]
+    if not op then return end
+
+    local meta = op.meta
+    local gname = op.gname
+    local unitPos = op.unitPos
+
+    local catKey = meta.categoryKey
+    local catEnum = (catKey == 'plane' and Group.Category.AIRPLANE)
+      or (catKey == 'helicopter' and Group.Category.HELICOPTER)
+      or (catKey == 'vehicle' and Group.Category.GROUND)
+      or (catKey == 'ship' and Group.Category.SHIP)
+      or Group.Category.GROUND
+
+    local newG = deepcopy(meta.tpl)
+    local keepUnits = {}
+    for i, u in ipairs(newG.units or {}) do
+      local uName = u.name
+      if not self.state.deadUnits[uName] then
+        if unitPos[uName] then
+          u.x = unitPos[uName].x
+          u.y = unitPos[uName].z
+          u.heading = unitPos[uName].heading or u.heading or 0
+        end
+        table.insert(keepUnits, u)
+      end
+    end
+    newG.units = keepUnits
+
+    if #newG.units > 0 then
+      local existing = Group.getByName(gname)
+      if existing and existing:isExist() then existing:destroy() end
+      coalition.addGroup(meta.countryId, catEnum, newG)
+      -- Optional: minimal logging to avoid overhead
+      -- log("Respawned group '" .. gname .. "' (" .. tostring(#newG.units) .. ")")
+    else
+      local existing = Group.getByName(gname)
+      if existing and existing:isExist() then existing:destroy() end
+    end
+
+    return timer.getTime() + (Persistence.spawnThrottleSeconds or 0.2)
+  end
+
+  if #ops > 0 then
+    timer.scheduleFunction(function() return step() end, {}, timer.getTime() + 0.1)
+  end
+end
+
 -- Bootstrap: load, announce, apply retries, start autosave
 function Persistence:bootstrap()
   if self._bootstrapped then return end
@@ -259,6 +419,11 @@ function Persistence:bootstrap()
   for _ in pairs(self.state.deadStatics or {}) do ds = ds + 1 end
   trigger.action.outText(string.format("Persistence: loaded %d units, %d statics. Applying...", du, ds), 10)
   self:applyStateWithRetries(30, 5)
+
+  -- After applying removals, respawn groups with saved positions
+  timer.scheduleFunction(function()
+    Persistence:applySavedPositions()
+  end, {}, timer.getTime() + 6)
 
   if self.autosaveSeconds and self.autosaveSeconds > 0 and not self._autosaveStarted then
     self._autosaveStarted = true
@@ -328,6 +493,13 @@ do
   missionCommands.addCommand("Apply now (debug)", root, function()
     local removed, au, fu, as, fs = Persistence:applyStateOnce()
     trigger.action.outText(string.format("Persistence apply: removed=%d, units found=%d/%d, statics found=%d/%d", removed, fu, au, fs, as), 10)
+  end)
+  missionCommands.addCommand("Capture positions now", root, function()
+    Persistence:captureUnitPositions()
+    trigger.action.outText("Persistence: positions snapshot updated.", 8)
+  end)
+  missionCommands.addCommand("Apply saved positions", root, function()
+    Persistence:applySavedPositions()
   end)
 end
 
