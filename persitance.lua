@@ -23,6 +23,8 @@ local Persistence = {
   },
 
   _saveDebounce = false,
+  _bootstrapped = false,
+  _autosaveStarted = false,
 }
 
 -- UTIL: Safe logging
@@ -201,21 +203,27 @@ end
 -- Apply saved removals; retry a few times while mission spawns in
 function Persistence:applyStateOnce()
   local removed = 0
+  local attemptedUnits, foundUnits = 0, 0
   for name, _ in pairs(self.state.deadUnits or {}) do
     local u = Unit.getByName(name)
+    attemptedUnits = attemptedUnits + 1
     if u and u:isExist() then
+      foundUnits = foundUnits + 1
       u:destroy()
       removed = removed + 1
     end
   end
+  local attemptedStatics, foundStatics = 0, 0
   for name, _ in pairs(self.state.deadStatics or {}) do
     local s = StaticObject.getByName(name)
+    attemptedStatics = attemptedStatics + 1
     if s and s:isExist() then
+      foundStatics = foundStatics + 1
       s:destroy()
       removed = removed + 1
     end
   end
-  return removed
+  return removed, attemptedUnits, foundUnits, attemptedStatics, foundStatics
 end
 
 function Persistence:applyStateWithRetries(retries, interval)
@@ -224,7 +232,7 @@ function Persistence:applyStateWithRetries(retries, interval)
   local attempt = 0
   local function tick()
     attempt = attempt + 1
-    local removed = Persistence:applyStateOnce()
+    local removed = select(1, Persistence:applyStateOnce())
     if attempt < retries then
       timer.scheduleFunction(tick, {}, timer.getTime() + interval)
     end
@@ -235,6 +243,33 @@ function Persistence:applyStateWithRetries(retries, interval)
   timer.scheduleFunction(tick, {}, timer.getTime() + 2)
 end
 
+-- Bootstrap: load, announce, apply retries, start autosave
+function Persistence:bootstrap()
+  if self._bootstrapped then return end
+  self._bootstrapped = true
+
+  if not self:ioAvailable() then
+    trigger.action.outText("Persistence disabled: enable lfs/io in Saved Games\\DCS...\\Scripts\\MissionScripting.lua (comment sanitizeModule for 'io' and 'lfs').", 20)
+    return
+  end
+
+  local loaded = self:load()
+  local du, ds = 0, 0
+  for _ in pairs(self.state.deadUnits or {}) do du = du + 1 end
+  for _ in pairs(self.state.deadStatics or {}) do ds = ds + 1 end
+  trigger.action.outText(string.format("Persistence: loaded %d units, %d statics. Applying...", du, ds), 10)
+  self:applyStateWithRetries(30, 5)
+
+  if self.autosaveSeconds and self.autosaveSeconds > 0 and not self._autosaveStarted then
+    self._autosaveStarted = true
+    local function loop()
+      self:save(true)
+      return timer.getTime() + self.autosaveSeconds
+    end
+    timer.scheduleFunction(function() return loop() end, {}, timer.getTime() + self.autosaveSeconds)
+  end
+end
+
 -- Event handler to record losses and handle start
 Persistence._handler = {}
 function Persistence._handler:onEvent(event)
@@ -242,26 +277,12 @@ function Persistence._handler:onEvent(event)
 
   if event.id == world.event.S_EVENT_MISSION_START then
     -- Load and apply saved state soon after start
-    if Persistence:ioAvailable() then
-      Persistence:load()
-      Persistence:applyStateWithRetries(30, 5)
-    else
-      trigger.action.outText("Persistence disabled: enable lfs/io in Saved Games\\DCS...\\Scripts\\MissionScripting.lua (comment sanitizeModule for 'io' and 'lfs').", 20)
-    end
-
-    -- Start autosave loop
-    if Persistence.autosaveSeconds and Persistence.autosaveSeconds > 0 and Persistence:ioAvailable() then
-      local function loop()
-        Persistence:save(true)
-        return timer.getTime() + Persistence.autosaveSeconds
-      end
-      timer.scheduleFunction(function() return loop() end, {}, timer.getTime() + Persistence.autosaveSeconds)
-    end
+    Persistence:bootstrap()
     return
   end
 
-  if event.id == world.event.S_EVENT_DEAD then
-    local obj = event.initiator
+  if event.id == world.event.S_EVENT_DEAD or event.id == world.event.S_EVENT_CRASH then
+    local obj = event.target or event.initiator
     if not obj or not obj.getCategory then return end
 
     -- Skip client/player losses if configured
@@ -304,6 +325,10 @@ do
     Persistence:reset()
   end)
   missionCommands.addCommand("Show key", root, function() trigger.action.outText("Persistence key: " .. Persistence:getKey(), 10) end)
+  missionCommands.addCommand("Apply now (debug)", root, function()
+    local removed, au, fu, as, fs = Persistence:applyStateOnce()
+    trigger.action.outText(string.format("Persistence apply: removed=%d, units found=%d/%d, statics found=%d/%d", removed, fu, au, fs, as), 10)
+  end)
 end
 
 if Persistence:ioAvailable() then
@@ -311,3 +336,6 @@ if Persistence:ioAvailable() then
 else
   log("Initialized with persistence DISABLED (no lfs/io).")
 end
+
+-- Run bootstrap shortly after script load as a fallback
+timer.scheduleFunction(function() Persistence:bootstrap() end, {}, timer.getTime() + 1)
